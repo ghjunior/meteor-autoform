@@ -446,18 +446,14 @@ if (typeof Handlebars !== 'undefined') {
     return new Handlebars.SafeString(html);
   });
 
-  function doBefore(docId, doc, hook, name) {
+  function doBefore(docId, doc, hook, name, def) {
     if (hook) {
       if (docId) {
-        doc = hook(docId, doc);
+        doc = hook(docId, doc, def);
       } else {
-        doc = hook(doc);
-      }
-      if (!_.isObject(doc)) {
-        throw new Error(name + " must return an object");
+        doc = hook(doc, def);
       }
     }
-    return doc;
   }
 
   Template._autoForm.events({
@@ -507,25 +503,6 @@ if (typeof Handlebars !== 'undefined') {
         event.preventDefault();
       }
 
-      // Gather all form values
-      var form = formValues(template, hooks.formToDoc || afObj.formToDoc, ss);
-
-      // Execute before hooks
-      var insertDoc = isInsert ? doBefore(null, form.insertDoc, beforeInsert, 'before.insert hook') : form.insertDoc;
-      var updateDoc = isUpdate && !_.isEmpty(form.updateDoc) ? doBefore(docId, form.updateDoc, beforeUpdate, 'before.update hook') : form.updateDoc;
-      var methodDoc = method ? doBefore(null, form.insertDoc, beforeMethod, 'before.method hook') : form.insertDoc;
-
-      // Get a version of the doc that has auto values to validate here. We
-      // don't want to actually send any auto values to the server because
-      // we ultimately want them generated on the server
-      var insertDocForValidation = ss.clean(_.clone(insertDoc), {
-        filter: false,
-        autoConvert: false,
-        extendAutoValueContext: {
-          userId: (Meteor.userId && Meteor.userId()) || null
-        }
-      });
-
       // Prep haltSubmission function
       function haltSubmission() {
         event.preventDefault();
@@ -549,29 +526,6 @@ if (typeof Handlebars !== 'undefined') {
         return result;
       }
 
-      // Perform validation for onSubmit call or for normal form submission
-      if ((hasOnSubmit || isNormalSubmit) && !isValid(insertDocForValidation, false, 'pre-submit validation')) {
-        return haltSubmission();
-      }
-
-      // Call onSubmit
-      if (hasOnSubmit) {
-        var context = {
-          event: event,
-          template: template,
-          resetForm: function() {
-            if (!template._notInDOM) {
-              template.find("form").reset();
-            }
-          }
-        };
-        // Pass both types of doc to onSubmit
-        var shouldContinue = onSubmit.call(context, insertDoc, updateDoc, currentDoc);
-        if (shouldContinue === false) {
-          return haltSubmission();
-        }
-      }
-
       // Prep callback creator function
       function makeCallback(name, afterHook) {
         return function(error, result) {
@@ -592,43 +546,104 @@ if (typeof Handlebars !== 'undefined') {
         };
       }
 
-      // Now we will do the requested insert, update, remove, method, or normal
-      // browser form submission. Even though we may have already validated above
-      // if we have an onSubmit hook, we do it again upon insert or update
-      // because collection2 validation catches additional stuff like unique.
-      if (isInsert) {
-        afObj._collection && afObj._collection.insert(insertDoc, {validationContext: formId}, makeCallback('insert', afterInsert));
-      } else if (isUpdate) {
-        if (!_.isEmpty(updateDoc)) {
-          afObj._collection && afObj._collection.update(docId, updateDoc, {validationContext: formId}, makeCallback('update', afterUpdate));
-        }
-      } else if (isRemove) {
-        //call beforeRemove if present, and stop if it's false
-        if (beforeRemove && beforeRemove(docId) === false) {
-          //stopped
-          return haltSubmission();
+      // Gather all form values
+      var form = formValues(template, hooks.formToDoc || afObj.formToDoc, ss);
+
+      // Execute before hooks
+      //var insertDoc = isInsert ? doBefore(null, form.insertDoc, beforeInsert, 'before.insert hook') : form.insertDoc;
+      //var updateDoc = isUpdate && !_.isEmpty(form.updateDoc) ? doBefore(docId, form.updateDoc, beforeUpdate, 'before.update hook') : form.updateDoc;
+      //var methodDoc = method ? doBefore(null, form.insertDoc, beforeMethod, 'before.method hook') : form.insertDoc;
+
+      function generateDoc(condition, doBeforeArgs, fallbackDoc) {
+        var def = jQuery.Deferred();
+
+        doBeforeArgs.push(def);
+
+        if (condition) {
+          doBefore.apply(this, doBeforeArgs);
         } else {
-          afObj._collection && afObj._collection.remove(docId, makeCallback('remove', afterRemove));
+          def.resolve(fallbackDoc);
         }
+
+        return def.promise();
       }
 
-      // We won't do an else here so that a method could be called in
-      // addition to another action on the same submit
-      if (method) {
-        var methodDocForValidation = ss.clean(_.clone(methodDoc), {
-          isModifier: true,
-          filter: false,
-          autoConvert: false,
-          extendAutoValueContext: {
-            userId: (Meteor.userId && Meteor.userId()) || null
+      jQuery.when(
+        generateDoc(isInsert, [null, form.insertDoc, beforeInsert, 'before.insert hook'], form.insertDoc),
+        generateDoc(isUpdate && !_.isEmpty(form.updateDoc), [docId, form.updateDoc, beforeUpdate, 'before.update hook'], form.updateDoc),
+        generateDoc(method, [null, form.insertDoc, beforeMethod, 'before.method hook'], form.insertDoc)).then(function(insertDoc, updateDoc, methodDoc) {
+        	// Get a version of the doc that has auto values to validate here. We
+          // don't want to actually send any auto values to the server because
+          // we ultimately want them generated on the server
+          var insertDocForValidation = ss.clean(_.clone(insertDoc), {
+            filter: false,
+            autoConvert: false,
+            extendAutoValueContext: {
+              userId: (Meteor.userId && Meteor.userId()) || null
+            }
+          });
+
+          // Perform validation for onSubmit call or for normal form submission
+          if ((hasOnSubmit || isNormalSubmit) && !isValid(insertDocForValidation, false, 'pre-submit validation')) {
+            return haltSubmission();
           }
-        });
-        // Validate first
-        if (!isValid(methodDocForValidation, false, method)) {
-          return haltSubmission();
-        }
-        Meteor.call(method, methodDoc, makeCallback(method, afterMethod));
-      }
+
+          // Call onSubmit
+          if (hasOnSubmit) {
+            var context = {
+              event: event,
+              template: template,
+              resetForm: function() {
+                if (!template._notInDOM) {
+                  template.find("form").reset();
+                }
+              }
+            };
+            // Pass both types of doc to onSubmit
+            var shouldContinue = onSubmit.call(context, insertDoc, updateDoc, currentDoc);
+            if (shouldContinue === false) {
+              return haltSubmission();
+            }
+          }
+
+          // Now we will do the requested insert, update, remove, method, or normal
+          // browser form submission. Even though we may have already validated above
+          // if we have an onSubmit hook, we do it again upon insert or update
+          // because collection2 validation catches additional stuff like unique.
+          if (isInsert) {
+            afObj._collection && afObj._collection.insert(insertDoc, {validationContext: formId}, makeCallback('insert', afterInsert));
+          } else if (isUpdate) {
+            if (!_.isEmpty(updateDoc)) {
+              afObj._collection && afObj._collection.update(docId, updateDoc, {validationContext: formId}, makeCallback('update', afterUpdate));
+            }
+          } else if (isRemove) {
+            //call beforeRemove if present, and stop if it's false
+            if (beforeRemove && beforeRemove(docId) === false) {
+              //stopped
+              return haltSubmission();
+            } else {
+              afObj._collection && afObj._collection.remove(docId, makeCallback('remove', afterRemove));
+            }
+          }
+
+          // We won't do an else here so that a method could be called in
+          // addition to another action on the same submit
+          if (method) {
+            var methodDocForValidation = ss.clean(_.clone(methodDoc), {
+              isModifier: true,
+              filter: false,
+              autoConvert: false,
+              extendAutoValueContext: {
+                userId: (Meteor.userId && Meteor.userId()) || null
+              }
+            });
+            // Validate first
+            if (!isValid(methodDocForValidation, false, method)) {
+              return haltSubmission();
+            }
+            Meteor.call(method, methodDoc, makeCallback(method, afterMethod));
+          }
+      });
     },
     'keyup [data-schema-key]': function(event, template) {
       var validationType = template.data.validationType;
